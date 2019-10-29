@@ -156,6 +156,7 @@ bool afPhysicalDevice::loadPhysicalDevice(YAML::Node *pd_node, std::string node_
     YAML::Node pDHardwareName = physicaDeviceNode["hardware name"];
     YAML::Node pDHapticGain = physicaDeviceNode["haptic gain"];
     YAML::Node pDControllerGain = physicaDeviceNode["controller gain"];
+    YAML::Node pDEnableJointControl = physicaDeviceNode["enable joint control"];
     YAML::Node pDDeadband = physicaDeviceNode["deadband"];
     YAML::Node pDMaxForce = physicaDeviceNode["max force"];
     YAML::Node pDMaxJerk = physicaDeviceNode["max jerk"];
@@ -203,6 +204,7 @@ bool afPhysicalDevice::loadPhysicalDevice(YAML::Node *pd_node, std::string node_
 
     bool _simulatedMBDefined = false;
     bool _rootLinkDefined = false;
+    bool _enableJointControl = true; // Be default enable the joint control of simulated dynamic body
 
     if (pDHardwareName.IsDefined()){
         _hardwareName = pDHardwareName.as<std::string>();
@@ -306,6 +308,10 @@ bool afPhysicalDevice::loadPhysicalDevice(YAML::Node *pd_node, std::string node_
             m_maxForce = _maxForce;
         }
     }
+    else{
+        // If not specified, use the value specified in the devices source file
+        m_maxForce = m_hInfo.m_maxLinearForce;
+    }
 
     if (pDMaxJerk.IsDefined()){
         double _maxJerk = pDMaxJerk.as<double>();
@@ -341,13 +347,19 @@ bool afPhysicalDevice::loadPhysicalDevice(YAML::Node *pd_node, std::string node_
     if (simDevice->m_rootLink){
         // Now check if the controller gains have been defined. If so, override the controller gains
         // defined for the rootlink of simulate end effector
+        bool linGainsDefined = false;
+        bool angGainsDefined = false;
         if (pDControllerGain.IsDefined()){
+            // Should we consider disable the controller for the physical device if a controller has been
+            // defined using the Physical device??
+
             // Check if the linear controller is defined
             if (pDControllerGain["linear"].IsDefined()){
                 double _P, _D;
                 _P = pDControllerGain["linear"]["P"].as<double>();
                 _D = pDControllerGain["linear"]["D"].as<double>();
-                simDevice->m_rootLink->m_controller.setLinearGains(_P, 0, _D);
+                m_controller.setLinearGains(_P, 0, _D);
+                linGainsDefined = true;
             }
 
             // Check if the angular controller is defined
@@ -355,12 +367,34 @@ bool afPhysicalDevice::loadPhysicalDevice(YAML::Node *pd_node, std::string node_
                 double _P, _D;
                 _P = pDControllerGain["angular"]["P"].as<double>();
                 _D = pDControllerGain["angular"]["D"].as<double>();
-                simDevice->m_rootLink->m_controller.setAngularGains(_P, 0, _D);
+                m_controller.setAngularGains(_P, 0, _D);
+                angGainsDefined = true;
             }
+        }
+        if(!linGainsDefined){
+            // If not controller gains defined for this physical device's simulated body,
+            // copy over the gains from the Physical device
+            m_controller.setLinearGains(simDevice->m_rootLink->m_controller.getP_lin(),
+                                        0,
+                                        simDevice->m_rootLink->m_controller.getD_lin());
+        }
+        if (!angGainsDefined){
+            // If not controller gains defined for this physical device's simulated body,
+            // copy over the gains from the Physical device
+            m_controller.setAngularGains(simDevice->m_rootLink->m_controller.getP_ang(),
+                                         0,
+                                         simDevice->m_rootLink->m_controller.getD_ang());
+        }
+
+        // Read the flag to enable disable the joint control of SDE from this input device
+        // Defaults to enabled
+        if (pDEnableJointControl.IsDefined()){
+            _enableJointControl = pDEnableJointControl.as<bool>();
         }
 
         simDevice->m_rigidGrippingConstraints.resize(simDevice->m_rootLink->getAFSensors().size());
         simDevice->m_softGrippingConstraints.resize(simDevice->m_rootLink->getAFSensors().size());
+        enableJointControl(_enableJointControl);
         // Initialize all the constraint to null ptr
         for (int sIdx = 0 ; sIdx < simDevice->m_rigidGrippingConstraints.size() ; sIdx++){
             simDevice->m_rigidGrippingConstraints[sIdx] = 0;
@@ -885,6 +919,74 @@ bool afInputDevices::loadInputDevices(std::string a_input_devices_config, int a_
     m_mode_str = "CAM_CLUTCH_CONTROL";
     m_mode_idx = 0;
 }
+
+
+///
+/// \brief afInputDevices::loadInputDevices
+/// \param a_inputdevice_config
+/// \param a_device_indices
+/// \return
+///
+bool afInputDevices::loadInputDevices(std::string a_input_devices_config, std::vector<int> a_device_indices){
+    if (a_input_devices_config.empty()){
+        a_input_devices_config = m_afWorld->getInputDevicesConfig();
+    }
+    YAML::Node inputDevicesNode;
+    try{
+        inputDevicesNode = YAML::LoadFile(a_input_devices_config);
+    }catch (std::exception &e){
+        std::cerr << "[Exception]: " << e.what() << std::endl;
+        std::cerr << "ERROR! FAILED TO LOAD CONFIG FILE: " << a_input_devices_config << std::endl;
+        return 0;
+    }
+
+    YAML::Node inputDevices = inputDevicesNode["input devices"];
+
+    m_basePath = boost::filesystem::path(a_input_devices_config).parent_path();
+
+    if (!inputDevices.IsDefined()){
+        return 0;
+    }
+
+    if (a_device_indices.size() >= 0 && a_device_indices.size() < inputDevices.size()){
+        m_deviceHandler.reset(new cHapticDeviceHandler());
+        for (int i = 0; i < a_device_indices.size(); i++){
+            int devIdx = a_device_indices[i];
+            if (devIdx >=0 && devIdx < inputDevices.size()){
+                afPhysicalDevice* pD = new afPhysicalDevice();
+                afSimulatedDevice* sD = new afSimulatedDevice(m_afWorld);
+
+                // Load the device specified in the afInputDevice yaml file
+                std::string devKey = inputDevices[devIdx].as<std::string>();
+                YAML::Node devNode = inputDevicesNode[devKey];
+
+                if (pD->loadPhysicalDevice(&devNode, devKey, m_deviceHandler.get(), sD, this)){
+                    InputControlUnit dgPair;
+                    dgPair.m_physicalDevice = pD;
+                    dgPair.m_simulatedDevice = sD;
+                    dgPair.m_name = devKey;
+                    m_psDevicePairs.push_back(dgPair);
+                }
+                else
+                {
+                    std::cerr << "WARNING: FAILED TO LOAD DEVICE: \"" << devKey << "\"\n";
+                }
+            }
+            else{
+                std::cerr << "ERROR: DEVICE INDEX : \"" << devIdx << "\" > \"" << inputDevices.size() << "\" NO. OF DEVICE SPECIFIED IN \"" << a_input_devices_config << "\"\n";
+            }
+        }
+    }
+    else{
+        std::cerr << "ERROR: SIZE OF DEVICE INDEXES : \"" << a_device_indices.size() << "\" > NO. OF DEVICE SPECIFIED IN \"" << a_input_devices_config << "\"\n";
+    }
+    m_numDevices = m_psDevicePairs.size();
+    m_use_cam_frame_rot = true;
+    m_simModes = CAM_CLUTCH_CONTROL;
+    m_mode_str = "CAM_CLUTCH_CONTROL";
+    m_mode_idx = 0;
+}
+
 
 ///
 /// \brief afInputDevices::getDeviceGripperPairs
